@@ -36,6 +36,7 @@ let testsTab = 'types'; // 'types' | 'results' | 'import'
 let testResultForm = null;
 
 let importParsedRows = []; // for PDF import review screen
+let importCollectionDate = null;
 let importBusy = false;
 
 let statsTab = 'scatter';
@@ -700,12 +701,24 @@ function parseLabLines(lines){
   return rows;
 }
 
+function parseCollectionDate(lines){
+  for(const line of lines){
+    const m = line.match(/Collected:\s*(\d{1,2})\/(\d{1,2})\/(\d{4})/);
+    if(m){
+      const mm = m[1].padStart(2,'0'), dd = m[2].padStart(2,'0'), yyyy = m[3];
+      return `${yyyy}-${mm}-${dd}`;
+    }
+  }
+  return null;
+}
+
 async function handlePdfUpload(inputEl){
   const file = inputEl.files[0]; if(!file) return;
   importBusy = true; render();
   try{
     const lines = await extractPdfLines(file);
     importParsedRows = parseLabLines(lines);
+    importCollectionDate = parseCollectionDate(lines);
     if(!importParsedRows.length) showToast('No analytes recognized — check the review table or try pasting text instead');
     else showToast('Parsed '+importParsedRows.length+' result(s) — review before saving');
   } catch(err){
@@ -785,14 +798,14 @@ function renderImportTab(){
     <div class="card">
       <h2>Review before import</h2>
       <div class="hint">Uncheck anything you don't want imported. Fix any values that parsed incorrectly — reference range formats vary across the report and won't all parse cleanly.</div>
-      <label>Result date (defaults to today — set to your collection date)</label>
-      <input type="date" id="importDate" value="${todayDateValue()}">
+      <label>Result date${importCollectionDate?' (pulled from the report\'s Collected date — adjust if needed)':' (defaults to today — set to your collection date)'}</label>
+      <input type="date" id="importDate" value="${importCollectionDate || todayDateValue()}">
       <table class="review">
         <thead><tr><th></th><th>Analyte</th><th>Value</th><th>Flag</th><th>Unit</th><th>Min</th><th>Max</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
       <button class="btn" onclick="confirmImport()">Import selected</button>
-      <button class="btn secondary" onclick="importParsedRows=[]; render()">Start over</button>
+      <button class="btn secondary" onclick="importParsedRows=[]; importCollectionDate=null; render()">Start over</button>
     </div>
   `;
 }
