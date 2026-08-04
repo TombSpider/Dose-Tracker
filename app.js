@@ -140,7 +140,8 @@ function renderNav(){
     {id:'doseLog', label:'Dose Log', action:"goView('doseLog')"},
     {id:'stats', label:'Stats', action:"goStats()"},
     {id:'manageSupplements', label:'Supplements', action:"goManageSupplements()"},
-    {id:'manageTests', label:'Tests', action:"goManageTests()"}
+    {id:'manageTests', label:'Tests', action:"goManageTests()"},
+    {id:'settings', label:'Settings', action:"goSettings()"}
   ];
   document.getElementById('navbar').innerHTML = items.map(it=>
     `<button class="navbtn ${currentView===it.id?'active':''}" onclick="${it.action}">${it.label}</button>`
@@ -1022,6 +1023,215 @@ function renderStats(){
   `;
 }
 
+/* ================= settings: backup & restore ================= */
+function goSettings(){ currentView='settings'; restorePending=null; render(); }
+let restorePending = null; // {format, data, summary}
+
+function downloadBackupNative(){
+  const payload = {
+    format: 'dtv3-native',
+    exportedAt: new Date().toISOString(),
+    supplements, doseEntries, testTypes, testResults
+  };
+  const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = 'dose-tracker-backup-'+new Date().toISOString().slice(0,10)+'.json';
+  document.body.appendChild(a); a.click(); document.body.removeChild(a);
+  setTimeout(()=>URL.revokeObjectURL(url), 2000);
+  showToast('Backup downloaded');
+}
+
+function handleRestoreFileSelect(inputEl){
+  const file = inputEl.files[0]; if(!file) return;
+  const reader = new FileReader();
+  reader.onload = (e)=>{
+    let data;
+    try{ data = JSON.parse(e.target.result); }
+    catch(err){ showToast('Could not read file: not valid JSON'); return; }
+
+    let format, summary;
+    if(data.format === 'legacy-v2-converted'){
+      format = 'legacy';
+      summary = {
+        supplements: (data.supplements||[]).length,
+        doseEntries: (data.dose_entries||[]).length,
+        testTypes: (data.test_types||[]).length,
+        testResults: (data.test_results||[]).length
+      };
+    } else if(data.format === 'dtv3-native' || Array.isArray(data.supplements)){
+      format = 'native';
+      summary = {
+        supplements: (data.supplements||[]).length,
+        doseEntries: (data.doseEntries||data.dose_entries||[]).length,
+        testTypes: (data.testTypes||data.test_types||[]).length,
+        testResults: (data.testResults||data.test_results||[]).length
+      };
+    } else {
+      showToast('Unrecognized file format');
+      return;
+    }
+    restorePending = {format, data, summary};
+    render();
+  };
+  reader.readAsText(file);
+}
+function cancelRestore(){ restorePending = null; render(); }
+
+async function confirmRestore(){
+  if(!restorePending) return;
+  const {format, data} = restorePending;
+  restorePending = 'busy';
+  render();
+  try{
+    if(format === 'legacy') await restoreLegacyFile(data);
+    else await restoreNativeFile(data);
+    showToast('Restore complete');
+  } catch(err){
+    console.error(err);
+    showToast('Restore failed: '+err.message);
+  }
+  restorePending = null;
+  await refreshAndRender();
+  currentView = 'settings'; render();
+}
+
+async function restoreLegacyFile(data){
+  const supplementIdMap = {};
+  for(const s of (data.supplements||[])){
+    let existing = supplements.find(x=>x.name.toLowerCase()===s.name.toLowerCase());
+    if(existing){ supplementIdMap[s.legacy_id] = existing.id; }
+    else {
+      const {data:ins} = await sb.from('supplements').insert({
+        name:s.name, dose_amount:s.dose_amount, dose_unit:s.dose_unit,
+        color: s.color || colorForIndex(supplements.length), show_on_graph:true
+      }).select().single();
+      supplementIdMap[s.legacy_id] = ins.id;
+      supplements.push(ins);
+    }
+  }
+
+  const doseRows = (data.dose_entries||[]).map(e=>({
+    supplement_id: supplementIdMap[e.legacy_supplement_id] || null,
+    time: new Date(e.time).toISOString(),
+    amount: e.amount, unit: e.unit,
+    body_status: e.body_status || 'na', brain_status: e.brain_status || 'na',
+    notes: e.notes || ''
+  })).filter(r=>r.supplement_id);
+  for(let i=0;i<doseRows.length;i+=200){
+    await sb.from('dose_entries').insert(doseRows.slice(i,i+200));
+  }
+
+  const testTypeIdMap = {}, metricIdMap = {};
+  for(const t of (data.test_types||[])){
+    let existingTT = testTypes.find(x=>x.name.toLowerCase()===t.name.toLowerCase());
+    let ttId;
+    if(existingTT){ ttId = existingTT.id; }
+    else {
+      const {data:ins} = await sb.from('test_types').insert({name:t.name}).select().single();
+      ttId = ins.id; existingTT = {...ins, metrics:[]}; testTypes.push(existingTT);
+    }
+    testTypeIdMap[t.legacy_id] = ttId;
+    for(const m of (t.metrics||[])){
+      let existingM = (existingTT.metrics||[]).find(x=>x.name.toLowerCase()===m.name.toLowerCase());
+      if(existingM){ metricIdMap[m.legacy_id] = existingM.id; }
+      else {
+        const {data:insM} = await sb.from('test_metrics').insert({
+          test_type_id:ttId, name:m.name, unit:m.unit,
+          target:m.target===''||m.target==null?null:m.target,
+          min:m.min===''||m.min==null?null:m.min,
+          max:m.max===''||m.max==null?null:m.max,
+          color:m.color||colorForIndex(existingTT.metrics.length), is_numeric:true, show_on_graph:true
+        }).select().single();
+        metricIdMap[m.legacy_id] = insM.id;
+        existingTT.metrics.push(insM);
+      }
+    }
+  }
+
+  for(const r of (data.test_results||[])){
+    const ttId = testTypeIdMap[r.legacy_test_type_id];
+    if(!ttId) continue;
+    const {data:resIns} = await sb.from('test_results').insert({test_type_id:ttId, date:r.date, notes:r.notes||''}).select().single();
+    const valueRows = Object.entries(r.values||{}).map(([legacyMetricId,val])=>{
+      const metricId = metricIdMap[legacyMetricId];
+      if(!metricId) return null;
+      const num = parseFloat(val);
+      return { test_result_id: resIns.id, metric_id: metricId, value: isNaN(num)?null:num, text_value: isNaN(num)?String(val):null };
+    }).filter(Boolean);
+    if(valueRows.length) await sb.from('test_result_values').insert(valueRows);
+  }
+}
+
+async function restoreNativeFile(data){
+  const supList = data.supplements||[];
+  const doseList = data.doseEntries||data.dose_entries||[];
+  const ttList = data.testTypes||data.test_types||[];
+  const trList = data.testResults||data.test_results||[];
+
+  for(const s of supList){
+    const {id, user_id, created_at, ...rest} = s;
+    await sb.from('supplements').upsert({id, ...rest});
+  }
+  for(const e of doseList){
+    const {id, user_id, ...rest} = e;
+    await sb.from('dose_entries').upsert({id, ...rest});
+  }
+  for(const t of ttList){
+    const {id, user_id, created_at, metrics, ...rest} = t;
+    await sb.from('test_types').upsert({id, ...rest});
+    for(const m of (metrics||t.test_metrics||[])){
+      const {id:mid, ...mrest} = m;
+      await sb.from('test_metrics').upsert({id:mid, ...mrest});
+    }
+  }
+  for(const r of trList){
+    const {id, user_id, values, test_result_values, ...rest} = r;
+    await sb.from('test_results').upsert({id, ...rest});
+    for(const v of (values||test_result_values||[])){
+      const {id:vid, ...vrest} = v;
+      await sb.from('test_result_values').upsert({id:vid, ...vrest});
+    }
+  }
+}
+
+function renderSettings(){
+  let restoreSection;
+  if(restorePending === 'busy'){
+    restoreSection = `<div class="empty">Restoring… this can take a moment for larger files.</div>`;
+  } else if(restorePending){
+    const s = restorePending.summary;
+    const label = restorePending.format === 'legacy' ? 'Legacy (pre-Supabase) backup detected' : 'Native backup detected — will restore/overwrite matching records exactly';
+    restoreSection = `
+      <div class="hint" style="margin-bottom:8px;">${label}</div>
+      <div class="list-row"><div>Supplements</div><div class="mono">${s.supplements}</div></div>
+      <div class="list-row"><div>Dose entries</div><div class="mono">${s.doseEntries}</div></div>
+      <div class="list-row"><div>Test types</div><div class="mono">${s.testTypes}</div></div>
+      <div class="list-row"><div>Test results</div><div class="mono">${s.testResults}</div></div>
+      ${restorePending.format==='legacy' ? '<div class="hint" style="margin-top:8px;">Supplements/test types will be matched to existing ones by name where possible, rather than duplicated.</div>' : ''}
+      <button class="btn" onclick="confirmRestore()">Confirm restore</button>
+      <button class="btn secondary" onclick="cancelRestore()">Cancel</button>
+    `;
+  } else {
+    restoreSection = `
+      <div class="hint" style="margin-bottom:8px;">Accepts either a backup downloaded from this app, or a legacy-converted file from an earlier version.</div>
+      <input type="file" accept="application/json" onchange="handleRestoreFileSelect(this)">
+    `;
+  }
+
+  return `
+    <div class="card">
+      <h2>Backup</h2>
+      <div class="hint" style="margin-bottom:8px;">Downloads everything currently in your account as a JSON file.</div>
+      <button class="btn" onclick="downloadBackupNative()">Backup now</button>
+    </div>
+    <div class="card">
+      <h2>Restore</h2>
+      ${restoreSection}
+    </div>
+  `;
+}
+
 /* ================= render dispatch ================= */
 function render(){
   renderNav();
@@ -1032,6 +1242,7 @@ function render(){
   else if(currentView==='manageSupplements') app.innerHTML = renderManageSupplements();
   else if(currentView==='manageTests') app.innerHTML = renderManageTests();
   else if(currentView==='stats') app.innerHTML = `<span class="back-link" onclick="goView('dashboard')">← Back</span>` + renderStats();
+  else if(currentView==='settings') app.innerHTML = `<span class="back-link" onclick="goView('dashboard')">← Back</span>` + renderSettings();
 }
 
 /* ================= init ================= */
