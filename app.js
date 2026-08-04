@@ -630,12 +630,11 @@ function renderResultsTab(){
 /* ---- PDF import ---- */
 function parseReferenceRange(str){
   if(!str) return {min:null, max:null};
-  str = str.trim();
-  let m = str.match(/^<\s*=?\s*([\d.]+)/);
+  let m = str.match(/<\s*=?\s*([\d.]+)/);
   if(m) return {min:null, max:parseFloat(m[1])};
-  m = str.match(/^>\s*(?:or\s*=?\s*)?=?\s*([\d.]+)/i);
+  m = str.match(/>\s*(?:or\s*)?=?\s*([\d.]+)/i);
   if(m) return {min:parseFloat(m[1]), max:null};
-  m = str.match(/^([\d.]+)\s*-\s*([\d.]+)/);
+  m = str.match(/([\d.]+)\s*-\s*([\d.]+)/);
   if(m) return {min:parseFloat(m[1]), max:parseFloat(m[2])};
   return {min:null, max:null};
 }
@@ -645,8 +644,9 @@ function convertValue(raw){
   if(/^negative$/i.test(raw)) return {value:0, text:null, is_numeric:true};
   let m = raw.match(/^(\d+)\s*:\s*(\d+)$/);
   if(m) return {value:parseFloat(m[2]), text:null, is_numeric:true};
-  const num = parseFloat(raw);
-  if(!isNaN(num) && /^[\d.]+$/.test(raw)) return {value:num, text:null, is_numeric:true};
+  const stripped = raw.replace(/^[<>]=?\s*/, '');
+  const num = parseFloat(stripped);
+  if(!isNaN(num)) return {value:num, text:null, is_numeric:true};
   return {value:null, text:raw, is_numeric:false};
 }
 
@@ -673,21 +673,29 @@ async function extractPdfLines(file){
 
 function parseLabLines(lines){
   const rows = [];
-  const skipWords = /^(Analyte|Value|Performing Sites|Key|These results|Quest,|Reference Range$)/i;
-  lines.forEach(line=>{
-    line = line.trim();
-    if(!line || skipWords.test(line)) return;
-    // Pattern: NAME  VALUE [H|L]  Reference Range: RANGE [unit]
-    let m = line.match(/^([A-Za-z][A-Za-z0-9 ,()\/\-]+?)\s+([\d.]+|POSITIVE|NEGATIVE|\d+:\d+)\s*(H|L)?\s*(?:Reference Range:?\s*(.*))?$/);
-    if(m){
-      const name = m[1].trim();
-      if(/^(Analyte|Client|Phone|Fax|Specimen|Patient)/i.test(name)) return;
-      const rawValue = m[2];
-      const rangeStr = (m[4]||'').trim();
-      const {min, max} = parseReferenceRange(rangeStr);
-      const conv = convertValue(rawValue);
-      rows.push({ name, rawValue, flag:m[3]||'', unit:'', min, max, target:null, value:conv.value, text:conv.text, is_numeric:conv.is_numeric, include:true });
-    }
+  const metaSkip = /DOB:|Specimen:|Client #|Requisition:|Received:|Collected:|Report Status:|Patient ID:|Fasting:|Performing Sites|Laboratory Director|Priority Out of Range|These results have been sent|Quest, Quest Diagnostics|party marks|Diagnostics Incorporated/i;
+  const stopNames = /^(range:?|optimal|moderate|high|low|weak|strong|reference|negative:?|positive:?)$/i;
+  lines.forEach(rawLine=>{
+    const line = rawLine.trim();
+    if(!line || metaSkip.test(line)) return;
+    // This report's layout places the reference-range text BEFORE the analyte
+    // name/value on the reconstructed line, not after — so we anchor on the
+    // last two whitespace-delimited "columns" (name, then value) rather than
+    // assuming reading order matches left-to-right position.
+    const cols = line.split(/\s{2,}/).map(c=>c.trim()).filter(Boolean);
+    if(cols.length < 2) return;
+    const last = cols[cols.length-1];
+    const name = cols[cols.length-2];
+    if(!/^[A-Za-z]/.test(name) || stopNames.test(name)) return;
+    const vm = last.match(/^([<>]?=?\s*[\d.]+|\d+:\d+|POSITIVE|NEGATIVE)\s*(H|L)?$/i);
+    if(!vm) return;
+    const rawValue = vm[1].trim();
+    const flag = (vm[2]||'').toUpperCase();
+    const leadCols = cols.slice(0, cols.length-2);
+    const unit = leadCols.slice().reverse().find(c => !/^[<>=\d]/.test(c) && !/^reference range:?$/i.test(c)) || '';
+    const {min, max} = parseReferenceRange(leadCols.join('  '));
+    const conv = convertValue(rawValue);
+    rows.push({ name, rawValue, flag, unit, min, max, target:null, value:conv.value, text:conv.text, is_numeric:conv.is_numeric, include:true });
   });
   return rows;
 }
@@ -767,6 +775,7 @@ function renderImportTab(){
       <td><input type="text" value="${escapeHtml(r.name)}" onchange="updateImportRow(${idx},'name',this.value)" style="width:130px;"></td>
       <td>${r.is_numeric ? `<input type="number" step="any" value="${r.value}" onchange="updateImportRow(${idx},'value',parseFloat(this.value))" style="width:70px;">` : `<input type="text" value="${escapeHtml(r.text||'')}" onchange="updateImportRow(${idx},'text',this.value)" style="width:90px;">`}</td>
       <td>${escapeHtml(r.flag||'')}</td>
+      <td><input type="text" value="${escapeHtml(r.unit||'')}" onchange="updateImportRow(${idx},'unit',this.value)" style="width:80px;"></td>
       <td><input type="number" step="any" value="${r.min??''}" onchange="updateImportRow(${idx},'min',parseFloat(this.value))" style="width:55px;"></td>
       <td><input type="number" step="any" value="${r.max??''}" onchange="updateImportRow(${idx},'max',parseFloat(this.value))" style="width:55px;"></td>
     </tr>
@@ -779,7 +788,7 @@ function renderImportTab(){
       <label>Result date (defaults to today — set to your collection date)</label>
       <input type="date" id="importDate" value="${todayDateValue()}">
       <table class="review">
-        <thead><tr><th></th><th>Analyte</th><th>Value</th><th>Flag</th><th>Min</th><th>Max</th></tr></thead>
+        <thead><tr><th></th><th>Analyte</th><th>Value</th><th>Flag</th><th>Unit</th><th>Min</th><th>Max</th></tr></thead>
         <tbody>${rows}</tbody>
       </table>
       <button class="btn" onclick="confirmImport()">Import selected</button>
