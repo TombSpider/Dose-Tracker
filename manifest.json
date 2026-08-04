@@ -1,0 +1,9 @@
+{
+  "name": "Dose & Test Log",
+  "short_name": "Dose Log",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#FAF8F3",
+  "theme_color": "#1D2B3A",
+  "icons": []
+}
